@@ -51,6 +51,27 @@ class UploadError(Exception):
     pass
 
 
+def connection_error_types(error):
+    """Describe nested exceptions without exposing URLs, signed fields or keys."""
+    pending = [error]
+    seen = set()
+    names = []
+    while pending and len(seen) < 20:
+        item = pending.pop(0)
+        if not isinstance(item, BaseException) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        label = type(item).__name__
+        number = getattr(item, 'errno', None)
+        if isinstance(number, int):
+            label += f'(errno={number})'
+        if label not in names:
+            names.append(label)
+        pending.extend([item.__cause__, item.__context__, getattr(item, 'reason', None)])
+        pending.extend(arg for arg in item.args if isinstance(arg, BaseException))
+    return ' -> '.join(names)
+
+
 def discover(folder):
     found = []
     ignored = []
@@ -118,8 +139,17 @@ class Outline:
     def absolute(self, url):
         return urljoin(self.base + '/', url)
 
+    def reconnect(self):
+        headers = dict(self.session.headers)
+        self.session.close()
+        self.session = self.requests.Session()
+        self.session.headers.update(headers)
+
     def call(self, endpoint, **body):
         # Outline limits several write endpoints to 25 requests/minute.
+        # Retry reads only: replaying an uncertain create can duplicate a page.
+        safe_read = endpoint in {'collections.list', 'documents.list', 'documents.info'}
+        failures = 0
         for attempt in range(8):
             time.sleep(max(0, 2.6 - (time.monotonic() - self.last_call)))
             self.last_call = time.monotonic()
@@ -128,8 +158,23 @@ class Outline:
                                              json=body, timeout=(15, 180),
                                              allow_redirects=False)
             except self.requests.RequestException:
+                failures += 1
+                if safe_read and failures < 3:
+                    self.reconnect()
+                    print(f'{endpoint}: connection interrupted; reconnecting '
+                          f'(retry {failures}/2).', flush=True)
+                    time.sleep(2 * failures)
+                    continue
                 raise UploadError(f'{endpoint}: connection failed or timed out. '
                                   'Rerun to resume; a write may have succeeded.') from None
+            if response.status_code in {502, 503, 504} and safe_read:
+                failures += 1
+                if failures < 3:
+                    self.reconnect()
+                    print(f'{endpoint}: HTTP {response.status_code}; reconnecting '
+                          f'(retry {failures}/2).', flush=True)
+                    time.sleep(2 * failures)
+                    continue
             if response.status_code == 429:
                 try:
                     delay = min(120, max(5, float(response.headers.get('Retry-After', 60))))
@@ -182,19 +227,33 @@ class Outline:
         # Never send an Outline API key to an external object-storage service.
         same_origin = urlsplit(target)[:2] == urlsplit(self.base)[:2]
         client = self.session if same_origin else self.requests.Session()
+        location = urlsplit(target)
+        destination = f'{location.scheme}://{location.hostname}'
+        if location.port:
+            destination += f':{location.port}'
+        print(f'  Transferring PDF to {destination} ({mode.upper()})', flush=True)
+        started = time.monotonic()
+        # urllib3 retains the connection timeout while sending the request
+        # body, and applies the read timeout only afterwards. A 15-second
+        # sendall timeout can therefore interrupt a healthy large upload.
+        upload_timeout = (300, 1800)
         try:
             with path.open('rb') as stream:
                 if mode == 'post':
                     response = client.post(target, data=result.get('form', {}),
                                            files={'file': (path.name, stream, 'application/pdf')},
-                                           timeout=(15, 1800), allow_redirects=False)
+                                           timeout=upload_timeout, allow_redirects=False)
                 elif mode == 'put':
                     response = client.put(target, data=stream, headers=result.get('headers', {}),
-                                          timeout=(15, 1800), allow_redirects=False)
+                                          timeout=upload_timeout, allow_redirects=False)
                 else:
                     raise UploadError(f'Unknown upload mode: {mode}')
-        except self.requests.RequestException:
-            raise UploadError('PDF transfer failed or timed out; rerun to resume.') from None
+        except self.requests.RequestException as exc:
+            elapsed = time.monotonic() - started
+            raise UploadError(f'PDF transfer failed after {elapsed:.1f}s to {destination}: '
+                              f'{connection_error_types(exc)}. '
+                              'Upload socket timeouts: connect/send 300s, response read 1800s. '
+                              'Progress retained; rerun to resume.') from None
         finally:
             if not same_origin:
                 client.close()
@@ -228,12 +287,31 @@ class PreviewBrowser:
               'When your workspace is visible, return here and press Enter: ')
 
     def enable(self, url, attachment_id):
+        for attempt in range(3):
+            try:
+                return self.enable_once(url, attachment_id)
+            except UploadError:
+                if attempt == 2:
+                    raise
+                # Selecting Show preview is idempotent here: the next attempt
+                # first checks whether the PDF is already embedded.
+                print(f'Preview timed out; opening a fresh tab '
+                      f'(retry {attempt + 1}/2).', flush=True)
+                time.sleep(3)
+
+    def enable_once(self, url, attachment_id):
         from playwright.sync_api import TimeoutError as BrowserTimeoutError
         timeout = getattr(self, 'timeout', 60000)
         stage = 'opening the browser and signing in'
         try:
             if self.context is None:
                 self.start()
+            # Keep login cookies but release the previous issue's PDF viewer
+            # and collaboration connection before opening another issue.
+            previous = self.page
+            self.page = self.context.new_page()
+            if previous and not previous.is_closed():
+                previous.close()
             stage = 'opening the issue in edit mode'
             # Stored document links retain the internal API origin. Use the
             # browser's configured origin so its session cookie applies.
@@ -362,6 +440,9 @@ def run(args):
         for year, month, path in files:
             if args.limit and completed >= args.limit:
                 break
+            # A browser preview can leave the HTTP pool idle for a while.
+            # Start each issue with a fresh API connection and the same key.
+            api.reconnect()
             fingerprint = digest(path)
             entry = state['issues'].get(path.name, {})
             if entry.get('sha256') and entry['sha256'] != fingerprint:
